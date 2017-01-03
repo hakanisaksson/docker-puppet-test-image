@@ -1,0 +1,13 @@
+#
+# hiera parameters file
+# install in /etc/puppet/hiera/common.yaml 
+#
+# Example: 
+# docker::docker_thinpool_enabled: false
+#
+hosts::entries: false
+#
+# puppet classes that always run (in agent mode)
+#
+classes:
+    - stdlib

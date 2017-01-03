@@ -1,0 +1,413 @@
+#!/bin/bash
+#
+# Download and test a puppet module
+#
+# Default puppet environment is "test", that does not contain any other classes but stdlib
+# Optionally use existing environments infradev_soe ... only dev environments synced.
+# or test on locally prepared path, under /tmp
+# 
+
+# Accepts all ENV variable to be overridden from docker commandline
+AGENT=${AGENT:=0}         ### Run puppet agent instead of apply?
+DEBUG=${DEBUG:=0}         ### Print debug messages
+NOOP=${NOOP:=0}           ### Add --noop to puppet command
+LISTENV=${LISTENV:=0}     ### List known puppet environments
+LISTMODS=${LISTMODS:=0}   ### List known puppet modules for environment
+
+#LOGFILE=${LOGFILE:=/tmp/puppet.apply.log}
+WORKDIR=${WORKDIR:=/tmp}
+WGETOPTS=${WGETOPTS:="--no-check-certificate -nc"}
+INSTALLOPTS=${INSTALLOPTS:="--ignore-dependencies --force"}
+PUPPETOPTS=${PUPPETOPTS:="--detailed-exitcodes"}
+DEFAULTENV=${DEFAULTENV:="test"}
+HIERACONFIG=${HIERACONFIG:="/etc/puppet/hiera.yaml"}
+ENVBASE=${ENVBASE:="/etc/puppet/modules/environment"}
+ENVNAME=${ENVNAME:=""}
+MODNAME=${MODNAME:=""}
+MODURL=${MODURL:=""}
+MODPATH=${MODPATH:=""}
+INCLUDE=${INCLUDE:="stdlib"}
+PREPARE=${PREPARE:=""}
+
+RET=0
+
+usage() {
+    echo "Smoketest a puppet module"
+    echo "  Downloads a puppet module and tests it with puppet apply"
+    echo "  can also test modules that already exist in the filesystem."
+    echo "  This image also contains a local puppet master that can test a catalog of modules in agent mode"
+    echo "  if the container is started with systemd enabled."
+    echo "  It already knows about the puppet modules published on pulp,"
+    echo "  and Modules can be rsynced from pulp before every test if that option is used."
+    echo ""
+    echo "  To be able to properly test the module it should contain a test case in ./tests/init.pp,"
+    echo "  but this script will try to create a simple test-script if not."
+    echo ""
+    echo "  Please observe that --detailed-exitcodes are used by default, refer to puppet documentation."
+    echo "  Foreman parameters are emulated with hiera, a default config that should work with common classes is included"
+    echo "  but you may have to supply your own hiera-config to tweak certain parameters."
+    echo ""
+    echo "  To test modules that start and stop services the you need to start with systemd,"
+    echo "  you need systemd to properly test them, refer to README.md for more info on how to use it."
+    echo "  If multiple url(s) are provided on the commandline, the script will download and install all in the selected environment, but only the last one will be tested."
+    echo ""
+    echo "usage:"
+    echo "  $0: <url(s) or local modulepath or known modulename>"
+    echo "options:"
+    echo "  -a              Agent mode (only available if running systemd)"
+    echo "  -c <config>     Path to alternative hiera_config (default: $HIERACONFIG)"
+    echo "  -d              Print debug info"
+    echo "  -e <env>        Puppet environment (default: $DEFAULTENV)"
+    echo "  -i <modname,..> Include dependency module(s) (default: $INCLUDE)"
+    echo "  -l              List known environments"
+    echo "  -m              List known modules for selected environment"
+    echo "  -n              Use the --noop option to puppet"
+    echo "  -o <options>    Append other options to the puppet command"
+    echo "  -p <dir>        Prepare path (copy modules and hieradata from selected env to this path, use with -i and -e)"
+    echo "examples:"
+    echo "  Test module in local path:"
+    echo "  $0 /tmp/mymodulepath/mymod"
+    echo "  Prepare local path and copy modules from infradev_soe:"
+    echo "  $0 -p /tmp/mymodulepath -e test <mod/url>"
+    echo ""
+    echo "This script also accepts overrides from ENV-variables for use with docker cmd-line,"
+    echo "typical variables:"
+    echo "  DEBUG         Print debug info (0/1)"
+    echo "  MODURL        Puppet module url"
+    echo "  MODNAME       Puppet module name"
+    echo "  ENVNAME       Puppet environment"
+    echo "  INCLUDE       Include dependencies (only has effect if ./tests/init.pp is generated)"
+    echo "  PUPPETOPTS    Extra options to puppet cmd (default: $PUPPETOPTS)"
+    echo "examples:"
+    echo "  docker run -it -v /tmp:/tmp -e PUPPETOPTS='--parser=future' -e MODNAME='ntp' docker-puppet-test-image $0 -a"
+    exit 2
+}
+
+msg() {
+    echo "[INFO] $*"
+}
+
+err() {
+    echo "[ERROR]" $*
+    exit 1
+}
+
+debug() {
+    test "$DEBUG" -eq 1 && echo "[DEBUG]" $*
+}
+
+#
+# try to figure out which environment to use depending on module path/name
+#
+get_envpath() {
+
+    if [ "$is_url" != "http" ]; then
+        ### Local path or known env
+        MODNAME=`basename $URL`
+        MODPATH=`dirname $URL`
+        test "$MODPATH" = "." && MODPATH=""
+        test -n "$MODPATH" -a -d "$MODPATH" && {
+	        test -z "$ENVNAME" && ENVNAME=`basename $MODPATH`
+	        ENVBASE=`dirname $MODPATH`
+	}
+        test -z "$ENVNAME" -a -z "$PREPARE" -a -z "$MODURL" && err "must use -e environment if not supplying a URL"
+        ENVPATH=${ENVBASE}/${ENVNAME}
+    #else
+        #test -z "$MODNAME" && MODNAME=`basename $URL | awk -F\- '{print $2}'`
+    fi
+
+    ENVPATH=${ENVBASE}/${ENVNAME}
+    #debug "get_envpath ENVPATH=$ENVPATH"
+
+    test -d "$ENVPATH" || {
+        ### default to test env if it's not found
+        ENVNAME=$DEFAULTENV
+        ENVPATH=${ENVBASE}/$ENVNAME
+    }
+
+    MODPATH=$ENVPATH/$MODNAME
+    test -f "$ENVPATH/environment.conf" && {
+        ENVPATH=`cat $ENVPATH/environment.conf |awk -F= '{print $2}'| awk  '{print $1}'`
+        debug "Replaced ENVPATH with path from $ENVPATH/environment.conf"
+    }
+
+    debug "env_path MODPATH=$MODPATH"
+    debug "env_path ENVNAME=$ENVNAME"
+    debug "env_path ENVPATH=$ENVPATH"
+    debug "env_path ENVBASE=$ENVBASE"
+
+}
+
+#
+# download mod if url or return false
+#
+download_mod() {
+    local murl=$1
+
+    is_url=`echo $murl | sed 's/^\(http\).*/\1/'`
+    debug "is_url=$is_url";
+    if [ "$is_url" = "http" ]; then
+        ### Download mod
+        msg "wget $WGETOPTS $murl"
+        wget $WGETOPTS "$murl"
+        modfile=`basename $murl`
+        test -e "$modfile" || err "Can't find modfile $modfile"
+        #MODNAME=`echo $modfile | sed 's/^CHANGEME-//' |awk -F\-  '{print $1}'`
+        MODNAME=`echo $modfile | awk -F\-  '{print $2}'`
+        test -z "$ENVNAME" && ENVNAME=`echo $murl | sed 's/.*NetEnt-rhel-\(.*\)-puppet.*/\1/' | sed 's/\-/\_/g'`
+        ENVPATH=${ENVBASE}/${ENVNAME}
+        return 0
+    else
+        return 1
+    fi
+}
+
+#
+# install mod in ENVNAME
+#
+install_mod() {
+    local mod=$1
+    if [ ! -d "$MODPATH" ]; then
+        test -e "$mod" && {
+            msg "puppet module install $INSTALLOPTS --environment $ENVNAME $mod"
+            puppet module install $INSTALLOPTS --environment $ENVNAME $mod
+            rm -f "$mod"
+        }
+    fi
+}
+
+#
+# Prepare local path
+#
+prepare_path() {
+    local modlist=$*
+    local dir=$PREPARE
+    debug "prepare_path($dir)"
+
+    test -z "$dir" && return 1
+    test -z "$ENVNAME" && err "Must use -e to specify which environment to copy modules from"
+    pre=`echo "$dir" |cut -c 1-4`
+    test "$pre" = "/tmp" || err "Prepare path must be under /tmp"
+    moddst=${dir}"/modules"
+    mkdir -p "$moddst"
+    mkdir -p "$dir/hiera"
+    test ! -e "$dir/hiera.yaml" && {
+        msg "Copy /etc/puppet/hiera.yaml to ${dir}/hiera.yaml"
+        cp /etc/puppet/hiera.yaml ${dir}/hiera.yaml 
+    }
+    test ! -e "$dir/hiera/common.yaml" && {
+        msg "Copy /etc/puppet/hiera/common.yaml to ${dir}/hiera/common.yaml"
+        cp /etc/puppet/hiera/common.yaml ${dir}/hiera/common.yaml
+    }
+    test -e "${dir}/hiera.yaml" && HIERACONFIG=${dir}/hiera.yaml
+
+    ### copy all included modules unless they already exist
+    SRCENV=${ENVBASE}/${ENVNAME}
+    for INC in $(echo $INCLUDE | sed "s/,/ /g"); do
+        modsrc="$SRCENV/$INC"
+        if [ -d "$modsrc" ]; then
+            if [ ! -d "$moddst/$INC" ]; then
+                msg "Copy $modsrc to $moddst" 
+                debug "cp -r $modsrc $moddst"
+                cp -r "$modsrc" "$moddst"
+            else
+                debug "prepare_path: Module already exists in $moddst/$INC"
+            fi
+        else
+            debug "prepare_path: No module found in $modsrc"
+        fi
+    done
+
+    ### copy all mods from $* unless they exist
+    for INC in $modlist; do
+        is_url2=`echo $INC | sed 's/^\(http\).*/\1/'`
+        test "$is_url2" = "http" && INC=`basename $INC | awk -F\-  '{print $2}'`
+        INC=`basename $INC`
+        modsrc="$SRCENV/$INC"
+        if [ -d "$modsrc" ]; then
+            if [ ! -d "$moddst/$INC" ]; then
+                msg "Copy $modsrc to $moddst" 
+                debug "cp -r $modsrc $moddst"
+                cp -r "$modsrc" "$moddst"
+            else
+                debug "prepare_path: Module already exists in $moddst/$INC"
+            fi
+        else
+            debug "prepare_path: No module found in $modsrc"
+        fi
+       ### reset ENVNAME to use the prepared path instead
+       ENVNAME=""
+       ENVBASE="$moddst"
+       ENVPATH="$moddst"
+       MODPATH="$moddst/$INC"
+    done
+    debug "prepare ENVBASE=$ENVBASE"
+    debug "prepare ENVPATH=$ENVPATH"
+    debug "prepare MODPATH=$MODPATH"
+}
+
+#
+# Generate tests/init.pp if missing
+#
+generate_test() {
+    # Do we have a tests/init.pp?
+    testfile=$MODPATH/tests/init.pp
+    debug "testfile=$testfile"
+
+    if [ ! -e  "$testfile" ]; then
+        msg "Missing testfile $testfile. Trying to generate one..."
+        mkdir -p $MODPATH/tests && {
+            touch $testfile || err "Can't create $testfile"
+            for INC in $(echo $INCLUDE | sed "s/,/ /g"); do
+                if [ "$INC" != "$MODNAME" ]; then
+                echo "include $INC" >> $testfile
+                fi
+            done
+            cat << EOF >> $testfile
+class {'$MODNAME': }
+EOF
+            msg "created $testfile"
+            test "$DEBUG" -eq 1 && {
+                cat $testfile
+                msg "---"
+            }
+        }
+    fi
+}
+
+run_puppet_apply() {
+    if [ -e "$testfile" ]; then
+        msg "puppet apply --modulepath=$ENVPATH --hiera_config=$HIERACONFIG --test $PUPPETOPTS $testfile"
+        puppet apply --modulepath=$ENVPATH --hiera_config=$HIERACONFIG --test $PUPPETOPTS $testfile
+        RET=$?
+    else
+        err "Missing testfile $testfile. Can't run puppet apply without a test case."
+        testfile=""
+    fi
+}
+
+run_puppet_agent() {
+    ### check master
+    ps -ef | grep -v grep | grep -q  "puppet master"
+    test $? -eq 1 && err "Puppet master process is not running, you need to start the container in daemonized mode."
+    ### add $INCLUDEs to sitefile
+    sitefile=/etc/puppet/manifests/site.pp
+    if [ -e "$sitefile" ]; then
+            cat /dev/null > $sitefile || err "Can't create $sitefile"
+            for INC in $(echo $INCLUDE | sed "s/,/ /g"); do
+                echo "include $INC" >> $sitefile
+            done
+            echo "hiera_include('classes')" >> $sitefile
+            debug "recreated $sitefile"
+    fi
+    hieradir=`dirname $HIERACONFIG`
+    classfile=$hieradir/hiera/common.yaml
+    if [ -e "$classfile" ]; then
+        grep -q "\- $MODNAME" $classfile|| {
+            echo "    - $MODNAME" >> $classfile
+            debug "added $MODNAME to $classfile"
+        }
+    fi
+    msg "puppet agent --environment=$ENVNAME --hiera_config=$HIERACONFIG --test $PUPPETOPTS"
+    puppet agent --environment=$ENVNAME --hiera_config=$HIERACONFIG --test $PUPPETOPTS 
+    RET=$?
+}
+
+#
+# Parse the options that are passed to the script
+#
+while getopts ac:de:i:hlo:p:mns opt
+do
+        case "${opt}" in
+            a) AGENT=1;;
+            c) HIERACONFIG=${OPTARG};;
+            d) DEBUG=1;;
+	    e) ENVNAME=${OPTARG};;
+            h) usage;;
+            i) INCLUDE=${OPTARG};;
+	    l) LISTENV=1;;
+            m) LISTMODS=1;;
+            n) NOOP=1;;
+	    o) PUPPETOPTS=${OPTARG};;
+            p) PREPARE=${OPTARG};;
+	    s) SYNC=1;;
+        esac
+done
+shift $(($OPTIND -1))
+
+### List known environments
+if [ $LISTENV -eq 1 ]; then
+    ls -1 /etc/puppet/modules/environment
+    exit 0
+fi
+
+### List known mods
+if [ $LISTMODS -eq 1 ]; then
+    if [ -n "$ENVNAME" ]; then
+        ls -1 /etc/puppet/modules/environment/$ENVNAME
+    else
+        err "No environment selected, use -e or ENVNAME"
+    fi
+    exit 0
+fi
+
+test -n "$MODNAME" && URL=$MODNAME
+test -n "$1" && URL=$1
+test -n "$MODURL" && URL=$MODURL
+test -z "$URL" -a "$LISTENV" != 1 && usage
+
+test "$NOOP" -eq 1 && PUPPETOPTS=$PUPPETOPTS" --noop"
+
+debug "DEBUG=$DEBUG"
+debug "NOOP=$NOOP"
+debug "WORKDIR=$WORKDIR"
+debug "WGETOPTS=$WGETOPTS"
+debug "INSTALLOPTS=$INSTALLOPTS"
+debug "PUPPETOPTS=$PUPPETOPTS"
+debug "ENVBASE=$ENVBASE"
+debug "ENVNAME=$ENVNAME"
+debug "MODURL=$MODURL"
+debug "HIERACONFIG=$HIERACONFIG"
+debug "INCLUDE=$INCLUDE"
+debug "PREPARE=$PREPARE"
+debug "MODNAME=$MODNAME"
+
+cd $WORKDIR
+
+
+MODS=$*
+test -z "$MODS" && MODS=$MODURL
+test -n "$MODNAME" && MODS="$MODNAME"  ### if docker ENV vars is used
+
+
+for URL in $MODS; do
+
+    if download_mod $URL; then
+        debug "downloaded $URL"
+        get_envpath
+        install_mod $modfile
+    else
+        is_url=""
+
+        get_envpath
+    fi
+done
+
+test -n "$PREPARE" && prepare_path $MODS ### create modpath if set
+
+debug "MODNAME=$MODNAME"
+
+test -d "$MODPATH" || err "Missing MODPATH $MODPATH"
+
+generate_test
+
+if [ "$AGENT" = "1" ]; then
+    run_puppet_agent
+else
+    run_puppet_apply
+fi
+
+test -e "$modfile" && rm -f $modfile
+msg "return code = $RET"
+exit $RET
+
